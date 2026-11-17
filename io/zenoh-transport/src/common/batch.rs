@@ -456,6 +456,9 @@ impl<TBuffer: BacktrackableReader + Buffer> RBatch<TBuffer> {
         let mut into = (buff)();
         let n = lz4_flex::block::decompress_into(payload, into.as_mut())
             .map_err(|_| zerror!("Decompression error"))?;
+        if n == 0 {
+            return Err(zerror!("Empty decompressed batch").into());
+        }
         let zslice = ZSlice::new(Arc::new(into), 0, n)
             .map_err(|_| zerror!("Invalid decompression buffer length"))?;
         Ok(zslice)
@@ -627,6 +630,62 @@ mod tests {
     };
 
     use super::*;
+
+    #[cfg(feature = "transport_compression")]
+    #[test]
+    fn reject_empty_decompressed_batch() {
+        // An uncompressed Close(Invalid) received by a compressed UDP link is
+        // misinterpreted as a batch header followed by an empty LZ4 block.
+        for bytes in [[0x03, 0x02], [0x01, 0x00]] {
+            for is_streamed in [false, true] {
+                let config = BatchConfig {
+                    mtu: 128,
+                    is_streamed,
+                    is_compression: true,
+                };
+                let mut buffer = Vec::new();
+                if is_streamed {
+                    buffer.extend_from_slice(&(bytes.len() as BatchSize).to_le_bytes());
+                }
+                buffer.extend_from_slice(&bytes);
+                let mut batch = RBatch::new(config, buffer.into_boxed_slice().into());
+                assert!(
+                    batch
+                        .initialize(|| vec![0; 128].into_boxed_slice())
+                        .is_err(),
+                    "accepted empty decompressed batch: {bytes:02x?}, streamed={is_streamed}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "transport_compression")]
+    #[test]
+    fn compressed_link_accepts_keep_alive() {
+        // Header + LZ4 literal block containing KeepAlive, and the uncompressed
+        // fallback used when compression would not make the batch smaller.
+        for bytes in [&[0x01, 0x10, 0x04][..], &[0x00, 0x04][..]] {
+            for is_streamed in [false, true] {
+                let config = BatchConfig {
+                    mtu: 128,
+                    is_streamed,
+                    is_compression: true,
+                };
+                let mut buffer = Vec::new();
+                if is_streamed {
+                    buffer.extend_from_slice(&(bytes.len() as BatchSize).to_le_bytes());
+                }
+                buffer.extend_from_slice(bytes);
+                let mut batch = RBatch::new(config, buffer.into_boxed_slice().into());
+                batch
+                    .initialize(|| vec![0; 128].into_boxed_slice())
+                    .unwrap();
+                let message: TransportMessage = batch.decode().unwrap();
+                assert_eq!(message, KeepAlive.into());
+                assert!(batch.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn rw_batch() {

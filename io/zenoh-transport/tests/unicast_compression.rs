@@ -467,6 +467,105 @@ mod tests {
 
     #[cfg(feature = "transport_udp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_compression_udp_rejects_uncompressed_close() {
+        use tokio::{net::UdpSocket, sync::oneshot};
+        use zenoh_transport::unicast::TransportManagerBuilderUnicast;
+
+        // Keep lease expiry well outside the assertion deadline: a malformed
+        // packet must close the transport rather than silently renewing it.
+        let lease = Duration::from_secs(120);
+        let router_id = ZenohIdProto::try_from([2]).unwrap();
+        let router_manager = TransportManager::builder()
+            .zid(router_id)
+            .whatami(WhatAmI::Router)
+            .unicast(
+                TransportManagerBuilderUnicast::default()
+                    .compression(true)
+                    .lease(lease)
+                    .keep_alive(120),
+            )
+            .build_test(Arc::new(SHClient))
+            .unwrap();
+        let router_addr = format!("127.0.0.1:{}", get_free_udp_port());
+        let endpoint: EndPoint = format!("udp/{router_addr}").parse().unwrap();
+        ztimeout!(router_manager.add_listener(endpoint)).unwrap();
+
+        let frontend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let proxy_endpoint: EndPoint = format!("udp/{}", frontend.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        backend.connect(router_addr).await.unwrap();
+        let (inject, mut injected) = oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let mut client = None;
+            let mut disconnected = false;
+            let mut from_client = vec![0; 65_535];
+            let mut from_router = vec![0; 65_535];
+            loop {
+                tokio::select! {
+                    _ = &mut injected, if !disconnected => {
+                        disconnected = true;
+                        // An unfamiliar router rejects the old session with an
+                        // uncompressed Close(Invalid), even though this client
+                        // expects a compression batch header.
+                        frontend.send_to(&[0x03, 0x02], client.unwrap()).await.unwrap();
+                    }
+                    packet = frontend.recv_from(&mut from_client) => {
+                        let (len, addr) = packet.unwrap();
+                        client = Some(addr);
+                        if !disconnected {
+                            backend.send(&from_client[..len]).await.unwrap();
+                        }
+                    }
+                    packet = backend.recv(&mut from_router) => {
+                        let len = packet.unwrap();
+                        if !disconnected {
+                            frontend.send_to(&from_router[..len], client.unwrap()).await.unwrap();
+                        }
+                    }
+                }
+            }
+        });
+
+        let client_manager = TransportManager::builder()
+            .zid(ZenohIdProto::try_from([1]).unwrap())
+            .whatami(WhatAmI::Client)
+            .unicast(
+                TransportManagerBuilderUnicast::default()
+                    .compression(true)
+                    .lease(lease)
+                    .keep_alive(120),
+            )
+            .build_test(Arc::new(SHClient))
+            .unwrap();
+        let transport = ztimeout!(client_manager.open_transport_unicast(proxy_endpoint)).unwrap();
+        assert_eq!(transport.get_zid().unwrap(), router_id);
+        inject.send(()).unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while client_manager
+                .get_transport_unicast(&router_id)
+                .await
+                .is_some()
+            {
+                tokio::time::sleep(SLEEP_COUNT).await;
+            }
+        })
+        .await;
+
+        // Clean up even when the assertion fails on an unfixed implementation.
+        proxy.abort();
+        let _ = proxy.await;
+        ztimeout!(client_manager.close());
+        ztimeout!(router_manager.close());
+        assert!(
+            closed.is_ok(),
+            "malformed compressed input kept the UDP transport alive"
+        );
+    }
+
+    #[cfg(feature = "transport_udp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn transport_unicast_compression_udp_only() {
         zenoh_util::init_log_from_env_or("error");
 
